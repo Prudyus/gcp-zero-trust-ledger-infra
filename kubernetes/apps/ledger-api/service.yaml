@@ -1,0 +1,170 @@
+###############################################################################
+# service.yaml — ledger-api exposure + mesh authorization (one applyable file)
+#
+# Exposure model (deliberate):
+#   * INTERNAL passthrough Network Load Balancer only. This is a financial
+#     ledger — it is never internet-facing. Consumers are other workloads
+#     in this VPC (or arriving via approved private paths: VPN/Interconnect
+#     into the consumer subnet).
+#   * externalTrafficPolicy: Local — client source IPs are preserved (the
+#     NetworkPolicy ipBlocks in deployment.yaml depend on this) and traffic
+#     lands only on nodes that actually host a ready ledger-api pod, cutting
+#     a hop and enabling honest health checks.
+#   * Zonal affinity hint stays default: with topology-spread across all
+#     three zones and Local traffic policy, cross-zone data charges are
+#     already minimized for LB traffic.
+#
+# Mesh authorization layer (Linkerd policy CRDs — enforced IN ADDITION to
+# NetworkPolicy L3/L4 rules):
+#   * Server "ledger-api-http" claims port 8080 with proxyProtocol HTTP/2-
+#     capable HTTP/1 detection disabled in favor of explicit HTTP/1.1+h2.
+#   * Only two client classes are authorized:
+#       (1) meshed workloads in platform namespaces (mTLS identities) —
+#           MeshTLSAuthentication;
+#       (2) unauthenticated networks used by the internal LB datapath +
+#           Google health checkers — NetworkAuthentication scoped to those
+#           CIDRs and ONLY those.
+#     Everything else — even meshed pods outside the platform set — is
+#     denied by the default all-authenticated inbound policy.
+###############################################################################
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-api
+  namespace: ledger
+  labels:
+    app.kubernetes.io/name: ledger-api
+    app.kubernetes.io/part-of: ledger-platform
+  annotations:
+    # GKE: provision an INTERNAL passthrough NLB (regional, RFC1918 VIP).
+    networking.gke.io/load-balancer-type: "Internal"
+    # Allow consumers in other subnets of this VPC region (VPN/Interconnect
+    # arrivals included) — without this, only the LB's own subnet may call.
+    networking.gke.io/internal-load-balancer-allow-global-access: "false"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ipFamilies: ["IPv4"]
+  ipFamilyPolicy: SingleStack
+  selector:
+    app.kubernetes.io/name: ledger-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http   # containerPort 8080 ("http") on the pod
+      protocol: TCP
+  sessionAffinity: None
+---
+# ---------------------------------------------------------------------------
+# In-cluster stable DNS for meshed consumers (bypasses the LB hop entirely;
+# Linkerd load-balances per-request over endpoints with mTLS identity).
+# vault, monitoring, and future platform services call THIS name:
+#   http://ledger-api-internal.ledger.svc.cluster.local
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-api-internal
+  namespace: ledger
+  labels:
+    app.kubernetes.io/name: ledger-api
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ledger-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+# ---------------------------------------------------------------------------
+# Linkerd Server: claims the workload port for policy attachment.
+# ---------------------------------------------------------------------------
+apiVersion: policy.linkerd.io/v1beta3
+kind: Server
+metadata:
+  name: ledger-api-http
+  namespace: ledger
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api
+  port: http
+  proxyProtocol: HTTP/1
+---
+# ---------------------------------------------------------------------------
+# Client class 1: meshed platform workloads, authenticated by mTLS identity.
+# Identities are '<sa>.<ns>.serviceaccount.identity.linkerd.cluster.local'.
+# Listed explicitly — no wildcard-all-mesh: adding a consumer is a PR.
+# ---------------------------------------------------------------------------
+apiVersion: policy.linkerd.io/v1alpha1
+kind: MeshTLSAuthentication
+metadata:
+  name: platform-mesh-clients
+  namespace: ledger
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  identities:
+    - "vault.vault.serviceaccount.identity.linkerd.cluster.local"
+    - "otel-collector.monitoring.serviceaccount.identity.linkerd.cluster.local"
+    - "default.consumers.serviceaccount.identity.linkerd.cluster.local"
+---
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: ledger-api-allow-mesh
+  namespace: ledger
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: ledger-api-http
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: platform-mesh-clients
+---
+# ---------------------------------------------------------------------------
+# Client class 2: the internal LB datapath. Passthrough NLB traffic arrives
+# with ORIGINAL client IPs (externalTrafficPolicy: Local) and is not meshed,
+# so it authenticates by network instead: consumer subnet + Google health
+# check ranges, nothing wider. L3 NetworkPolicy mirrors these same CIDRs —
+# two layers must both agree before a packet reaches the app.
+# ---------------------------------------------------------------------------
+apiVersion: policy.linkerd.io/v1alpha1
+kind: NetworkAuthentication
+metadata:
+  name: internal-lb-clients
+  namespace: ledger
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  networks:
+    - cidr: 10.10.0.0/20     # consumer subnet (VPN/Interconnect arrivals included)
+    - cidr: 130.211.0.0/22   # Google LB health checks
+    - cidr: 35.191.0.0/16    # Google LB health checks
+---
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: ledger-api-allow-internal-lb
+  namespace: ledger
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: ledger-api-http
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: NetworkAuthentication
+      name: internal-lb-clients

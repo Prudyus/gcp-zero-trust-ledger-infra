@@ -1,0 +1,363 @@
+###############################################################################
+# deployment.yaml — ledger-api workload (namespace, identity, network policy,
+# deployment, autoscaling, disruption budget — one applyable file)
+#
+# Contracts wired here:
+#   * KSA ledger/ledger-api ↔ GSA ledger-api@PROJECT_ID (workload-identity.tf)
+#     → Spanner session AS the append-only `ledger_app` role, nothing more.
+#   * linkerd.io/inject at the NAMESPACE → every pod is meshed; inbound
+#     policy is all-authenticated (linkerd-values.yaml).
+#   * NetworkPolicies (enforced by Dataplane V2) default-deny both ways and
+#     re-open only: DNS, Spanner/Google APIs via the private VIP, Vault,
+#     Linkerd control plane, intra-mesh proxy traffic, and health checks.
+#   * `restricted` Pod Security — possible because Linkerd runs in CNI mode.
+#   * Image path is the immutable-tag AR repo; CI (Module 4) is the only
+#     writer. Binary Authorization admits nothing else.
+# Substitute PROJECT_ID / REGION before apply (or template via kustomize).
+###############################################################################
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ledger
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+    network-policy: platform
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    linkerd.io/inject: enabled
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ledger-api
+  namespace: ledger
+  labels:
+    app.kubernetes.io/name: ledger-api
+    app.kubernetes.io/part-of: ledger-platform
+  annotations:
+    iam.gke.io/gcp-service-account: "ledger-api@PROJECT_ID.iam.gserviceaccount.com"
+automountServiceAccountToken: false
+---
+# ---------------------------------------------------------------------------
+# Default deny — nothing in, nothing out, for every pod in the namespace.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: ledger
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# ---------------------------------------------------------------------------
+# Egress: kube-dns only, on DNS ports.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: ledger
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# ---------------------------------------------------------------------------
+# Egress: Google APIs strictly via the private VIP (Spanner, STS, logging).
+# Also: the GKE metadata server (Workload Identity token exchange) at the
+# link-local metadata address.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-google-apis
+  namespace: ledger
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.8/30
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 988
+---
+# ---------------------------------------------------------------------------
+# Egress: Vault (secrets + transit PII encryption) and the Linkerd control
+# plane (identity/destination/policy APIs); plus intra-namespace proxy
+# traffic on the mesh inbound port.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-platform
+  namespace: ledger
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - protocol: TCP
+          port: 8200
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: linkerd
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8090
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ledger
+      ports:
+        - protocol: TCP
+          port: 4143
+---
+# ---------------------------------------------------------------------------
+# Ingress: (a) mesh traffic to the proxy inbound port from platform
+# namespaces; (b) internal LB client traffic + Google health checkers to the
+# app/proxy ports; (c) Module 5 collector scraping proxy metrics on 4191.
+# With `externalTrafficPolicy: Local` (service.yaml) client and health-check
+# source IPs are preserved, hence the explicit ipBlocks.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-ledger-api
+  namespace: ledger
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network-policy: platform
+      ports:
+        - protocol: TCP
+          port: 4143
+    - from:
+        - ipBlock:
+            cidr: 10.10.0.0/20     # consumer subnet (internal LB clients)
+        - ipBlock:
+            cidr: 130.211.0.0/22   # Google LB health checks
+        - ipBlock:
+            cidr: 35.191.0.0/16    # Google LB health checks
+      ports:
+        - protocol: TCP
+          port: 4143
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 4191
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-api
+  namespace: ledger
+  labels:
+    app.kubernetes.io/name: ledger-api
+    app.kubernetes.io/part-of: ledger-platform
+spec:
+  # No `replicas`: the HPA below owns scale from the first apply.
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-api
+        app.kubernetes.io/part-of: ledger-platform
+      annotations:
+        # Metrics contract with Module 5 (app metrics; proxy has 4191).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Graceful mesh shutdown ordering on pod termination.
+        config.linkerd.io/shutdown-grace-period: "30s"
+    spec:
+      serviceAccountName: ledger-api
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ledger-api
+
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: ledger-api
+
+      containers:
+        - name: ledger-api
+          # Immutable tag in the CI-owned AR repo; CI (Module 4) bumps this.
+          image: REGION-docker.pkg.dev/PROJECT_ID/images/ledger-api:v1.0.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            - name: PORT
+              value: "8080"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: SPANNER_DATABASE
+              value: "projects/PROJECT_ID/instances/ledger-production/databases/ledger"
+            - name: SPANNER_DATABASE_ROLE
+              value: "ledger_app"   # append-only FGAC role — the ONLY role IAM permits
+            - name: VAULT_ADDR
+              value: "http://vault.vault.svc.cluster.local:8200"
+            - name: VAULT_TRANSIT_KEY
+              value: "ledger-pii"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ledger-api
+  namespace: ledger
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ledger-api
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-api
+  namespace: ledger
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api

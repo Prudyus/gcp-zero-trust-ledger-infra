@@ -1,0 +1,148 @@
+###############################################################################
+# linkerd-values.yaml — Linkerd control plane values (HA, zero-trust defaults)
+#
+# Why these choices:
+#   * CNI PLUGIN MODE (cniEnabled: true): proxy-init needs NET_ADMIN/NET_RAW,
+#     which the `restricted` Pod Security level on our workload namespaces
+#     forbids. The linkerd-cni DaemonSet does the iptables work at node
+#     level instead, so MESHED PODS STAY FULLY RESTRICTED. (The CNI chains
+#     cleanly behind GKE Dataplane V2.)
+#   * defaultInboundPolicy: all-authenticated → any unmeshed, un-mTLS'd
+#     client is denied by default, cluster-wide. Kubelet probes remain
+#     authorized automatically by Linkerd's built-in probe routes.
+#   * disableHeartBeat: the cluster has NO internet egress (Module 1); the
+#     version-check heartbeat would just generate logged firewall denies.
+#   * All images pinned to the Artifact Registry pull-through mirror of
+#     cr.l5d.io (Module 2, repo l5d-remote) — the only sanctioned entry
+#     point for third-party images. Substitute REGION / PROJECT_ID.
+#
+# Install order (Helm, versions = Linkerd 2.18 charts; check patch level):
+#
+#   # 0. Trust anchor + issuer (offline, e.g. with `step`; anchor key goes
+#   #    to offline custody, ONLY the issuer key touches the cluster):
+#   step certificate create root.linkerd.cluster.local ca.crt ca.key \
+#     --profile root-ca --no-password --insecure --not-after 87600h
+#   step certificate create identity.linkerd.cluster.local issuer.crt issuer.key \
+#     --profile intermediate-ca --ca ca.crt --ca-key ca.key \
+#     --no-password --insecure --not-after 8760h
+#
+#   helm repo add linkerd https://helm.linkerd.io/stable
+#
+#   # 1. CNI plugin (its own namespace; the ONLY privileged Linkerd piece):
+#   helm install linkerd2-cni linkerd/linkerd2-cni \
+#     --namespace linkerd-cni --create-namespace \
+#     --set image.name=REGION-docker.pkg.dev/PROJECT_ID/l5d-remote/linkerd/cni-plugin
+#
+#   # 2. CRDs, then control plane with THIS values file:
+#   helm install linkerd-crds linkerd/linkerd-crds \
+#     --namespace linkerd --create-namespace
+#   helm install linkerd-control-plane linkerd/linkerd-control-plane \
+#     --namespace linkerd \
+#     -f kubernetes/infra/linkerd-values.yaml \
+#     --set-file identityTrustAnchorsPEM=ca.crt \
+#     --set-file identity.issuer.tls.crtPEM=issuer.crt \
+#     --set-file identity.issuer.tls.keyPEM=issuer.key
+#
+#   # 3. Verify: linkerd check
+#
+# Issuer rotation is an OPERATIONS DUTY: re-issue before the 8760h expiry
+# (or automate with cert-manager later). Expired issuer = mesh-wide outage.
+###############################################################################
+
+# --- Zero-trust defaults ------------------------------------------------------
+
+# Meshed workloads reject any connection that lacks a Linkerd mTLS identity.
+proxy:
+  defaultInboundPolicy: all-authenticated
+
+  image:
+    name: REGION-docker.pkg.dev/PROJECT_ID/l5d-remote/linkerd/proxy
+
+  resources:
+    cpu:
+      request: 100m
+    memory:
+      request: 64Mi
+      limit: 256Mi
+
+  # Fail closed: if the proxy cannot start, the pod must not serve.
+  await: true
+
+  logLevel: warn,linkerd=info
+
+proxyInit:
+  # Present for completeness; with cniEnabled=true no proxy-init container
+  # is injected into workloads.
+  image:
+    name: REGION-docker.pkg.dev/PROJECT_ID/l5d-remote/linkerd/proxy-init
+  runAsRoot: false
+
+# CNI mode: no NET_ADMIN in workload pods (see header).
+cniEnabled: true
+
+# --- Control plane HA -----------------------------------------------------------
+
+controllerReplicas: 3
+enablePodAntiAffinity: true
+enablePodDisruptionBudget: true
+
+controllerImage: REGION-docker.pkg.dev/PROJECT_ID/l5d-remote/linkerd/controller
+policyController:
+  image:
+    name: REGION-docker.pkg.dev/PROJECT_ID/l5d-remote/linkerd/policy-controller
+  resources:
+    cpu:
+      request: 100m
+    memory:
+      request: 128Mi
+      limit: 512Mi
+debugContainer:
+  image:
+    name: REGION-docker.pkg.dev/PROJECT_ID/l5d-remote/linkerd/debug
+
+controllerResources: &controller_resources
+  cpu:
+    request: 100m
+  memory:
+    request: 128Mi
+    limit: 512Mi
+
+destinationResources: *controller_resources
+identityResources: *controller_resources
+proxyInjectorResources: *controller_resources
+heartbeatResources: *controller_resources
+
+# --- Identity ----------------------------------------------------------------------
+
+identity:
+  issuer:
+    scheme: kubernetes.io/tls
+  # trustAnchorsPEM / issuer certs are provided via --set-file (header).
+
+# Rotate workload certs frequently; short-lived identity is the point.
+identityTrustDomain: cluster.local
+
+# --- Air-gap / ops -------------------------------------------------------------------
+
+# No internet egress: never attempt the version-check phone-home.
+disableHeartBeat: true
+
+# Control plane log format for Cloud Logging structured ingestion.
+controllerLogLevel: info
+controllerLogFormat: json
+
+# Prometheus scraping (Module 5 collector) hits each proxy's :4191/metrics
+# and the control plane's admin ports directly — no linkerd-viz stack is
+# installed; Managed Prometheus is the single metrics plane.
+podMonitor:
+  enabled: false
+
+# High-churn financial workloads: keep endpoint updates snappy.
+destinationController:
+  meshedHttp2ClientProtobuf:
+    keep_alive:
+      interval:
+        seconds: 10
+      timeout:
+        seconds: 3
+      while_idle: true
