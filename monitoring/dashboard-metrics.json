@@ -1,0 +1,306 @@
+{
+  "displayName": "Ledger Platform — Zero-Trust Overview",
+  "mosaicLayout": {
+    "columns": 48,
+    "tiles": [
+      {
+        "xPos": 0,
+        "yPos": 0,
+        "width": 48,
+        "height": 4,
+        "widget": {
+          "title": "About this dashboard",
+          "text": {
+            "content": "**Data plane:** Managed Service for Prometheus (PromQL). App + Linkerd + Vault series arrive via the OTel collector (`monitoring/collector-config.yaml`); Spanner series (`spanner_googleapis_com:*`) are native Cloud Monitoring metrics. Import: `gcloud monitoring dashboards create --config-from-file=monitoring/dashboard-metrics.json`. Container CPU/memory detail lives in GKE's built-in dashboards (`kubernetes_io:container_*`) and is intentionally not duplicated here.",
+            "format": "MARKDOWN"
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 4,
+        "width": 10,
+        "height": 8,
+        "widget": {
+          "title": "ledger-api success rate (5m)",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "sum(rate(response_total{namespace=\"ledger\", direction=\"inbound\", classification=\"success\"}[5m])) / clamp_min(sum(rate(response_total{namespace=\"ledger\", direction=\"inbound\"}[5m])), 1e-9)"
+            },
+            "sparkChartView": { "sparkChartType": "SPARK_LINE" },
+            "thresholds": [
+              { "value": 0.995, "color": "YELLOW", "direction": "BELOW" },
+              { "value": 0.99, "color": "RED", "direction": "BELOW" }
+            ]
+          }
+        }
+      },
+      {
+        "xPos": 10,
+        "yPos": 4,
+        "width": 10,
+        "height": 8,
+        "widget": {
+          "title": "Request rate (inbound, req/s)",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "sum(rate(response_total{namespace=\"ledger\", direction=\"inbound\"}[5m]))"
+            },
+            "sparkChartView": { "sparkChartType": "SPARK_LINE" }
+          }
+        }
+      },
+      {
+        "xPos": 20,
+        "yPos": 4,
+        "width": 10,
+        "height": 8,
+        "widget": {
+          "title": "mTLS share of inbound traffic",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "sum(rate(response_total{namespace=\"ledger\", direction=\"inbound\", tls=\"true\"}[5m])) / clamp_min(sum(rate(response_total{namespace=\"ledger\", direction=\"inbound\"}[5m])), 1e-9)"
+            },
+            "sparkChartView": { "sparkChartType": "SPARK_LINE" },
+            "thresholds": [
+              { "value": 0.9, "color": "RED", "direction": "BELOW" }
+            ]
+          }
+        }
+      },
+      {
+        "xPos": 30,
+        "yPos": 4,
+        "width": 9,
+        "height": 8,
+        "widget": {
+          "title": "Vault unsealed (min across pods)",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "min(vault_core_unsealed)"
+            },
+            "sparkChartView": { "sparkChartType": "SPARK_LINE" },
+            "thresholds": [
+              { "value": 1, "color": "RED", "direction": "BELOW" }
+            ]
+          }
+        }
+      },
+      {
+        "xPos": 39,
+        "yPos": 4,
+        "width": 9,
+        "height": 8,
+        "widget": {
+          "title": "Spanner high-priority CPU",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "max(spanner_googleapis_com:instance_cpu_utilization_by_priority{priority=\"high\"})"
+            },
+            "sparkChartView": { "sparkChartType": "SPARK_LINE" },
+            "thresholds": [
+              { "value": 0.55, "color": "YELLOW", "direction": "ABOVE" },
+              { "value": 0.65, "color": "RED", "direction": "ABOVE" }
+            ]
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 12,
+        "width": 16,
+        "height": 16,
+        "widget": {
+          "title": "Inbound request rate by deployment (req/s)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (deployment) (rate(response_total{namespace=\"ledger\", direction=\"inbound\"}[5m]))"
+                },
+                "plotType": "LINE"
+              }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 16,
+        "yPos": 12,
+        "width": 16,
+        "height": 16,
+        "widget": {
+          "title": "Success rate over time (alert floor 99%)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (deployment) (rate(response_total{namespace=\"ledger\", direction=\"inbound\", classification=\"success\"}[5m])) / clamp_min(sum by (deployment) (rate(response_total{namespace=\"ledger\", direction=\"inbound\"}[5m])), 1e-9)"
+                },
+                "plotType": "LINE"
+              }
+            ],
+            "thresholds": [
+              { "value": 0.99, "color": "RED", "direction": "BELOW" }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 32,
+        "yPos": 12,
+        "width": 16,
+        "height": 16,
+        "widget": {
+          "title": "Request latency p50 / p99 (ms, mesh-observed)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le) (rate(response_latency_ms_bucket{namespace=\"ledger\", direction=\"inbound\"}[5m])))"
+                },
+                "plotType": "LINE"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.50, sum by (le) (rate(response_latency_ms_bucket{namespace=\"ledger\", direction=\"inbound\"}[5m])))"
+                },
+                "plotType": "LINE"
+              }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 28,
+        "width": 16,
+        "height": 16,
+        "widget": {
+          "title": "Zero-trust denials: proxy authz + policy (req/s)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (namespace) (rate(inbound_http_authz_deny_total[5m]))"
+                },
+                "plotType": "STACKED_BAR"
+              }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 16,
+        "yPos": 28,
+        "width": 16,
+        "height": 16,
+        "widget": {
+          "title": "Spanner CPU utilization by priority (autoscaler target 65%)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max by (priority) (spanner_googleapis_com:instance_cpu_utilization_by_priority{instance_id=\"ledger-production\"})"
+                },
+                "plotType": "LINE"
+              }
+            ],
+            "thresholds": [
+              { "value": 0.65, "color": "RED", "direction": "ABOVE" }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 32,
+        "yPos": 28,
+        "width": 16,
+        "height": 16,
+        "widget": {
+          "title": "Spanner API request latency p99 (s, by method)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le, method) (rate(spanner_googleapis_com:api_request_latencies_bucket{instance_id=\"ledger-production\"}[5m])))"
+                },
+                "plotType": "LINE"
+              }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 44,
+        "width": 24,
+        "height": 16,
+        "widget": {
+          "title": "Spanner storage used vs limit (bytes)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(spanner_googleapis_com:instance_storage_used_bytes{instance_id=\"ledger-production\"})"
+                },
+                "plotType": "LINE"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "max(spanner_googleapis_com:instance_storage_limit_bytes{instance_id=\"ledger-production\"})"
+                },
+                "plotType": "LINE"
+              }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      },
+      {
+        "xPos": 24,
+        "yPos": 44,
+        "width": 24,
+        "height": 16,
+        "widget": {
+          "title": "Vault request handling latency p99 (ms) & raft leadership changes",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le) (rate(vault_core_handle_request_bucket[5m])))"
+                },
+                "plotType": "LINE"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum(increase(vault_core_leadership_setup_failed[1h])) or vector(0)"
+                },
+                "plotType": "STACKED_BAR"
+              }
+            ],
+            "yAxis": { "scale": "LINEAR" },
+            "chartOptions": { "mode": "COLOR" }
+          }
+        }
+      }
+    ]
+  },
+  "labels": {
+    "platform": "ledger",
+    "environment": "production"
+  }
+}

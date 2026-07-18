@@ -1,0 +1,213 @@
+###############################################################################
+# collector-config.yaml — OpenTelemetry Collector configuration (GKE)
+#
+# Topology: ONE collector Deployment (single replica, namespace `monitoring`)
+# scrapes app + mesh + Vault metrics and writes them into Google Cloud
+# Managed Service for Prometheus (GMP) via the googlemanagedprometheus
+# exporter. Ingestion rides monitoring.googleapis.com, which resolves to the
+# private googleapis VIP (Module 1) — the collector needs NO internet path,
+# consistent with the zero-egress posture. GKE system metrics (container
+# CPU/memory, kubelet, etc.) are exported by GKE itself and are NOT
+# re-scraped here; Spanner metrics arrive natively in Cloud Monitoring.
+# Everything lands in one metrics plane, queryable with PromQL — which is
+# exactly what dashboard-metrics.json consumes.
+#
+# Deployment contract (per cluster):
+#   * Image: otel/opentelemetry-collector-contrib — pulled ONLY through the
+#     AR mirror: REGION-docker.pkg.dev/PROJECT_ID/dockerhub-remote/otel/
+#     opentelemetry-collector-contrib:<pin> (contrib build ships the
+#     googlemanagedprometheus exporter).
+#   * Namespace `monitoring` labeled: network-policy=platform,
+#     pod-security.kubernetes.io/enforce=restricted, and annotated
+#     linkerd.io/inject=enabled (the collector is itself meshed, so its
+#     scrapes of proxy ports carry an mTLS identity).
+#   * ServiceAccount `otel-collector` annotated
+#     iam.gke.io/gcp-service-account: ledger-otel@PROJECT_ID.iam.gserviceaccount.com
+#     (Workload Identity binding + metricWriter role: workload-identity.tf).
+#     automountServiceAccountToken: true is REQUIRED on the collector pod —
+#     kubernetes_sd_configs discovery uses the in-cluster API.
+#   * RBAC: ClusterRole get/list/watch on pods, nodes, services, endpoints,
+#     endpointslices, namespaces; bound to monitoring/otel-collector.
+#   * NetworkPolicies in `monitoring` (default-deny mirror of Module 3):
+#     egress → kube-dns :53, metadata server 169.254.169.254 (:80/:988),
+#     googleapis VIP 199.36.153.8/30 :443, and scrape targets in the
+#     ledger / vault / linkerd namespaces; ingress → none required.
+#
+# ⚠ AMENDMENT TO MODULE 3 (one line of intent, two ports of YAML): the
+# ledger namespace ingress policy currently admits `monitoring` on 4191
+# only. App metrics live on 8080, so extend allow-ingress-ledger-api with:
+#
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: monitoring
+#       ports:
+#         - protocol: TCP
+#           port: 4191
+#         - protocol: TCP
+#           port: 8080      # <-- added: app /metrics
+#
+# (vault and linkerd namespaces declare no NetworkPolicies → scrapes pass.)
+###############################################################################
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  prometheus:
+    config:
+      global:
+        scrape_interval: 30s
+        scrape_timeout: 10s
+
+      scrape_configs:
+        # ---------------------------------------------------------------
+        # 1. Annotation-driven app pods (ledger-api /metrics on :8080 —
+        #    contract set in Module 3 podAnnotations).
+        # ---------------------------------------------------------------
+        - job_name: kubernetes-pods
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_phase]
+              action: keep
+              regex: Running
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              action: replace
+              target_label: __metrics_path__
+              regex: (.+)
+            - source_labels:
+                - __address__
+                - __meta_kubernetes_pod_annotation_prometheus_io_port
+              action: replace
+              regex: ([^:]+)(?::\d+)?;(\d+)
+              replacement: $$1:$$2
+              target_label: __address__
+            - source_labels: [__meta_kubernetes_namespace]
+              action: replace
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              action: replace
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+              action: replace
+              target_label: app
+
+        # ---------------------------------------------------------------
+        # 2. Linkerd data plane — every proxy's admin endpoint (:4191).
+        #    Source of the golden metrics: response_total (success/mTLS),
+        #    response_latency_ms_bucket, inbound_http_authz_{allow,deny}.
+        # ---------------------------------------------------------------
+        - job_name: linkerd-proxy
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - source_labels:
+                - __meta_kubernetes_pod_container_name
+                - __meta_kubernetes_pod_container_port_name
+              action: keep
+              regex: linkerd-proxy;linkerd-admin
+            - source_labels: [__meta_kubernetes_namespace]
+              action: replace
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              action: replace
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_label_linkerd_io_proxy_deployment]
+              action: replace
+              target_label: deployment
+          metric_relabel_configs:
+            # Bound cardinality: authority/dst_* label explosions are the
+            # classic Linkerd metrics cost trap.
+            - action: labeldrop
+              regex: (authority|dst_authority|client_id|server_id)
+
+        # ---------------------------------------------------------------
+        # 3. Linkerd control plane (destination/identity/injector admin).
+        # ---------------------------------------------------------------
+        - job_name: linkerd-control-plane
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [linkerd]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              action: keep
+              regex: admin-http
+            - source_labels: [__meta_kubernetes_pod_label_linkerd_io_control_plane_component]
+              action: replace
+              target_label: component
+            - source_labels: [__meta_kubernetes_namespace]
+              action: replace
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              action: replace
+              target_label: pod
+
+        # ---------------------------------------------------------------
+        # 4. Vault — unauthenticated Prometheus endpoint enabled in the
+        #    listener telemetry stanza (Module 2 vault-config.yaml).
+        #    Key series: vault_core_unsealed, raft + request metrics.
+        # ---------------------------------------------------------------
+        - job_name: vault
+          metrics_path: /v1/sys/metrics
+          params:
+            format: ["prometheus"]
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [vault]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+              action: keep
+              regex: vault
+            - source_labels: [__meta_kubernetes_pod_container_port_number]
+              action: keep
+              regex: "8200"
+            - source_labels: [__meta_kubernetes_namespace]
+              action: replace
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              action: replace
+              target_label: pod
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Attaches project/location/cluster from the GKE metadata server so the
+  # exporter can map series onto the prometheus_target monitored resource.
+  resourcedetection:
+    detectors: [gcp]
+    timeout: 10s
+
+  batch:
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+    timeout: 10s
+
+exporters:
+  googlemanagedprometheus:
+    # Project inferred from the metadata server / Workload Identity;
+    # pinned explicitly so a misconfigured pod fails loudly, not sideways.
+    project: PROJECT_ID
+
+service:
+  extensions: [health_check]
+
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [googlemanagedprometheus]
+
+  telemetry:
+    logs:
+      level: info
+      encoding: json
