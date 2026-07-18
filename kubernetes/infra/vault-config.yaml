@@ -1,0 +1,255 @@
+###############################################################################
+# vault-config.yaml — HashiCorp Vault: namespace hardening + Helm values +
+# post-install policy bootstrap (three YAML documents, one file).
+#
+# Role in this architecture: Vault serves platform secrets that are NOT
+# already covered by Workload Identity (API signing keys, third-party
+# credentials, transit encryption for PII fields). GCP-native access
+# (Spanner, KMS, AR) stays on Workload Identity — Vault is not a proxy
+# for Google IAM.
+#
+# Install (image comes through the AR Docker Hub mirror — the cluster has
+# no internet path; substitute PROJECT_ID / REGION):
+#
+#   kubectl apply -f kubernetes/infra/vault-config.yaml   # ns + policy CM
+#   helm repo add hashicorp https://helm.releases.hashicorp.com
+#   helm install vault hashicorp/vault \
+#     --namespace vault --version 0.31.0 \
+#     -f <(yq 'select(document_index == 1).data["values.yaml"]' \
+#          kubernetes/infra/vault-config.yaml) \
+#     --set "server.image.repository=REGION-docker.pkg.dev/PROJECT_ID/dockerhub-remote/hashicorp/vault"
+#
+# First-boot (once, any one pod — KMS auto-unseal means NO unseal keys
+# exist; only recovery keys, which go straight to offline custody):
+#
+#   kubectl -n vault exec vault-0 -- vault operator init \
+#     -recovery-shares=5 -recovery-threshold=3 -format=json
+#   kubectl -n vault exec vault-1 -- vault operator raft join http://vault-0.vault-internal:8200
+#   kubectl -n vault exec vault-2 -- vault operator raft join http://vault-0.vault-internal:8200
+#   # then run the bootstrap script from the ConfigMap with a root token:
+#   kubectl -n vault exec -it vault-0 -- sh /vault/userconfig/bootstrap/bootstrap.sh
+#   # …and REVOKE the root token immediately after.
+###############################################################################
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+    # Vault + injector run non-root with no privilege requirements.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    # Module 3 default-deny NetworkPolicies key off this label.
+    network-policy: platform
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-helm-values
+  namespace: vault
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+data:
+  values.yaml: |
+    global:
+      enabled: true
+      tlsDisable: true   # pod-to-pod TLS is provided by Linkerd mTLS (Module 3);
+                         # Vault listener stays HTTP inside the mesh boundary.
+
+    injector:
+      enabled: true
+      replicas: 2
+      # Injected sidecars also ride the mesh; the injector itself is meshed
+      # via the namespace annotation applied in Module 3.
+      agentDefaults:
+        cpuLimit: "250m"
+        cpuRequest: "100m"
+        memLimit: "128Mi"
+        memRequest: "64Mi"
+
+    server:
+      # image.repository is overridden at install time to the AR mirror
+      # (see header) — no direct Docker Hub pulls are possible in-cluster.
+      image:
+        tag: "1.19.0"
+
+      replicas: 3
+
+      # Spread across the regional cluster's zones.
+      affinity: |
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ template "vault.name" . }}
+                  component: server
+              topologyKey: topology.kubernetes.io/zone
+
+      topologySpreadConstraints: []
+
+      # Workload Identity: KSA vault/vault ↔ GSA ledger-vault@…
+      # (google_service_account_iam_member.vault_wi). The annotation below
+      # completes the binding on the Kubernetes side.
+      serviceAccount:
+        create: true
+        name: vault
+        annotations:
+          iam.gke.io/gcp-service-account: "ledger-vault@PROJECT_ID.iam.gserviceaccount.com"
+
+      statefulSet:
+        securityContext:
+          pod:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          container:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+
+      readinessProbe:
+        enabled: true
+        # 204 only when initialized, unsealed, active or standby.
+        path: /v1/sys/health?standbyok=true&sealedcode=503&uninitcode=503
+      livenessProbe:
+        enabled: true
+        path: /v1/sys/health?standbyok=true
+        initialDelaySeconds: 60
+
+      dataStorage:
+        enabled: true
+        size: 20Gi
+        storageClass: null   # cluster default: pd-ssd CSI
+
+      auditStorage:
+        enabled: true
+        size: 10Gi
+
+      # Raft integrated storage + GCP KMS auto-unseal (key + IAM from
+      # workload-identity.tf; credentials arrive via Workload Identity —
+      # no key file, no GOOGLE_APPLICATION_CREDENTIALS).
+      ha:
+        enabled: true
+        replicas: 3
+        raft:
+          enabled: true
+          setNodeId: true
+          config: |
+            ui = false
+
+            listener "tcp" {
+              address         = "[::]:8200"
+              cluster_address = "[::]:8201"
+              tls_disable     = "true"
+
+              # Trust only same-pod callers; Linkerd terminates peer mTLS.
+              proxy_protocol_behavior = "deny_unauthorized"
+              telemetry {
+                unauthenticated_metrics_access = "true"   # scraped by Module 5 collector on /v1/sys/metrics
+              }
+            }
+
+            storage "raft" {
+              path = "/vault/data"
+
+              retry_join {
+                leader_api_addr = "http://vault-0.vault-internal:8200"
+              }
+              retry_join {
+                leader_api_addr = "http://vault-1.vault-internal:8200"
+              }
+              retry_join {
+                leader_api_addr = "http://vault-2.vault-internal:8200"
+              }
+            }
+
+            seal "gcpckms" {
+              project    = "PROJECT_ID"
+              region     = "REGION"
+              key_ring   = "ledger-production-keyring"
+              crypto_key = "vault-unseal"
+            }
+
+            service_registration "kubernetes" {}
+
+            telemetry {
+              prometheus_retention_time = "30s"
+              disable_hostname          = true
+            }
+
+      # Audit device target (enabled in bootstrap.sh below).
+      volumes: []
+      volumeMounts: []
+
+      standalone:
+        enabled: false
+
+    ui:
+      enabled: false   # no UI exposure; operations via CLI over port-forward
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-bootstrap
+  namespace: vault
+  labels:
+    app.kubernetes.io/part-of: ledger-platform
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    # One-time post-init bootstrap. Run inside vault-0 with VAULT_TOKEN set
+    # to the initial root token; REVOKE that token when this completes.
+    set -eu
+
+    export VAULT_ADDR="http://127.0.0.1:8200"
+
+    echo "==> Enabling file audit device (append-only audit trail)"
+    vault audit enable file file_path=/vault/audit/audit.log || true
+
+    echo "==> Enabling Kubernetes auth (in-cluster API + mounted SA token)"
+    vault auth enable kubernetes || true
+    vault write auth/kubernetes/config \
+      kubernetes_host="https://kubernetes.default.svc"
+
+    echo "==> KV v2 mount for application secrets"
+    vault secrets enable -path=secret -version=2 kv || true
+
+    echo "==> Transit mount for field-level PII encryption"
+    vault secrets enable transit || true
+    vault write -f transit/keys/ledger-pii type=aes256-gcm96 || true
+
+    echo "==> Policy: ledger-api (read own secrets; encrypt/decrypt PII)"
+    vault policy write ledger-api - <<'POLICY'
+    path "secret/data/ledger-api/*" {
+      capabilities = ["read"]
+    }
+    path "transit/encrypt/ledger-pii" {
+      capabilities = ["update"]
+    }
+    path "transit/decrypt/ledger-pii" {
+      capabilities = ["update"]
+    }
+    POLICY
+
+    echo "==> Role binding: ONLY ledger/ledger-api may use the policy"
+    vault write auth/kubernetes/role/ledger-api \
+      bound_service_account_names=ledger-api \
+      bound_service_account_namespaces=ledger \
+      policies=ledger-api \
+      ttl=1h \
+      max_ttl=4h
+
+    echo "==> Bootstrap complete. NOW REVOKE THE ROOT TOKEN:"
+    echo "    vault token revoke <initial-root-token>"
