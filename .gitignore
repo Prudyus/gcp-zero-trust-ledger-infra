@@ -1,0 +1,37 @@
+# --- Terraform ---------------------------------------------------------------
+.terraform/
+.terraform.lock.hcl.backup
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Variable files may contain project IDs / network CIDRs — keep them local.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Terraform override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# --- Mesh / Vault key material -----------------------------------------------
+# Linkerd trust anchor & issuer generated with `step` (offline custody only).
+*.key
+ca.crt
+issuer.crt
+
+# Vault init output (recovery keys / root token must NEVER touch git).
+vault-init*.json
+*.recovery
+
+# --- Local tooling -----------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/
+sbom*.json
+kubeconfig*
