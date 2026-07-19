@@ -28,7 +28,7 @@
 # =============================================================================
 # Stage 1 — build: static, reproducible-leaning Go binary
 # =============================================================================
-ARG GO_VERSION=1.24
+ARG GO_VERSION=1.26
 FROM golang:${GO_VERSION}-alpine AS build
 
 WORKDIR /src
