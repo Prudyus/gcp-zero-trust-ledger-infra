@@ -129,7 +129,7 @@ jobs:
           provenance: false
 
       - name: Vulnerability gate (Trivy)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: local/ledger-api:scan
           format: table
@@ -139,7 +139,7 @@ jobs:
           vuln-type: os,library
 
       - name: Generate SBOM (CycloneDX)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: local/ledger-api:scan
           format: cyclonedx
@@ -154,7 +154,7 @@ jobs:
 
       # ------------- push phase: refs/heads/main and refs/tags/v* only -----
       - name: Authenticate to Google Cloud (WIF)
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
         id: auth
         uses: google-github-actions/auth@v2
         with:
@@ -164,7 +164,7 @@ jobs:
           access_token_lifetime: 600s
 
       - name: Login to Artifact Registry
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -175,7 +175,7 @@ jobs:
       # this call effectively only uploads. AR tag immutability means a
       # re-run of an identical ref fails loudly instead of repointing.
       - name: Push image
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
         id: push
         uses: docker/build-push-action@v6
         with:
@@ -190,14 +190,14 @@ jobs:
           provenance: false
 
       - name: Install cosign
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
         uses: sigstore/cosign-installer@v3
 
       # Keyless signature by DIGEST (never by mutable ref); the Fulcio
       # certificate binds this exact repo+ref. Signature lands in AR next
       # to the image (docker credentials already in the keychain).
       - name: Sign image (cosign keyless)
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
         env:
           IMAGE_DIGEST_REF: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
         run: |
@@ -207,7 +207,7 @@ jobs:
   # ===========================================================================
   update-manifest:
     name: Bump image tag in manifest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && vars.GCP_WIF_PROVIDER != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: build
